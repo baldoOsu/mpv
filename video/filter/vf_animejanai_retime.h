@@ -96,10 +96,12 @@ typedef double (*rt_mad_fn)(void *ctx, int64_t i);
 static inline int rt_behind(const struct rt_params *rp) { return rp->maxhold - 1; }
 static inline int rt_ahead(const struct rt_params *rp) { return rp->maxhold; }
 
+// A frame is a key unless its transition is a hold (mad < hold): the Python
+// Planner's exact test, so a NaN metric counts as a new drawing there too.
 static inline bool rt_is_key(const struct rt_params *rp, int64_t j,
                              rt_mad_fn mad, void *ctx)
 {
-    return j == 0 || mad(ctx, j) >= rp->hold;
+    return j == 0 || !(mad(ctx, j) < rp->hold);
 }
 
 // Plan source position p (0 <= p < n) of a stream of n frames (or
