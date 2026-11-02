@@ -105,7 +105,7 @@ static inline bool rt_is_key(const struct rt_params *rp, int64_t j,
 }
 
 // Plan source position p (0 <= p < n) of a stream of n frames (or
-// RT_N_UNKNOWN while more than rt_ahead() frames follow p). Calls mad()
+// RT_N_UNKNOWN while at least rt_ahead() frames follow p). Calls mad()
 // only for 1 <= i <= min(p + rt_ahead(), n - 1), i >= p - rt_behind().
 static inline struct rt_plan rt_plan(const struct rt_params *rp, int64_t p,
                                      int64_t n, rt_mad_fn mad, void *ctx)

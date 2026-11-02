@@ -1572,9 +1572,12 @@ static void rt_process(struct mp_filter *vf)
     struct mp_image *list[RT_FACTOR_MAX];
     int cnt = 0;
     struct mp_image *src = NULL;  // frame pos as output, shared by its slots
+    bool interp_failed = false;   // RIFE failed at this position: no retries
     for (int k = 0; k < slots; k++) {
         struct rt_step st = rt_slot(rp, &plan, pos, k, scene);
         struct mp_image *img = NULL;
+        if (st.interp && interp_failed)
+            st = (struct rt_step){false, pos, -1, 0.0};
         if (st.interp) {
             struct rt_frame *ra = rt_rec(p, st.a), *rb = rt_rec(p, st.b);
             bool sc = false;
@@ -1588,6 +1591,7 @@ static void rt_process(struct mp_filter *vf)
             } else if (!img) {
                 MP_WARN(vf, "retime: interpolation failed; showing the "
                             "source frame\n");
+                interp_failed = true;
             }
             if (!img)
                 st = (struct rt_step){false, pos, -1, 0.0};
