@@ -1887,6 +1887,12 @@ static void vf_animejanai_process(struct mp_filter *vf)
         struct mp_image *src = mp_refqueue_get(p->queue, 0);
         if (!src)
             return;
+        // Pipelined upscale-only work still queued from before a reconfigure
+        // (e.g. the RIFE engine's background build finishing): upscale_image()
+        // pops ring[0], so leftovers would come back in place of this
+        // chain's frames. Their inputs are still queued and get re-rendered.
+        if (p->ring_n)
+            clear_ring(vf);
         const double in_fps = src->nominal_fps;
         // The rife/upscale read this owned work-res source frame. With a
         // pre-RIFE downscale it's source -> work res via aji_resize; otherwise
@@ -1902,7 +1908,12 @@ static void vf_animejanai_process(struct mp_filter *vf)
             cur_src = stage_src_d3d11(vf, src);
         else
 #endif
-            cur_src = mp_image_new_ref(src);
+        {
+            // interp_source() reads this decoder frame directly: order the
+            // stream after its decode (the upscale path does this in
+            // submit_frame, the interpolation path did not).
+            cur_src = order_after_decode(vf) ? mp_image_new_ref(src) : NULL;
+        }
         if (!cur_src) {
             mp_filter_internal_mark_failed(vf);
             return;
