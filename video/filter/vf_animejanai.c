@@ -1396,8 +1396,9 @@ static struct mp_image *rt_copy(struct mp_filter *vf, struct mp_image *in)
 }
 
 // Hold metric input: read the source luma plane back and area-average it
-// to 192x108 sums. Synchronizes p->stream (which also completes the frame's
-// copy / pre-RIFE downscale queued before it).
+// to 192x108 sums. Runs right after the frame's copy / pre-RIFE downscale,
+// which already ordered p->stream after its decode; synchronizes p->stream
+// (completing that copy too).
 static bool rt_metric(struct mp_filter *vf, struct mp_image *in,
                       uint64_t *sums)
 {
@@ -1422,11 +1423,11 @@ static bool rt_metric(struct mp_filter *vf, struct mp_image *in,
         .WidthInBytes  = row,
         .Height        = in->h,
     };
-    if (!order_after_decode(vf) ||
-        CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0)
+    if (CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0)
         return false;
-    bool ok = CHECK_CU(p->cu->cuMemcpy2DAsync(&cpy, p->stream)) >= 0 &&
-              CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
+    bool ok = CHECK_CU(p->cu->cuMemcpy2DAsync(&cpy, p->stream)) >= 0;
+    // also on failure: the caller may free the frame the copy wrote
+    ok &= CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
     CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
     if (ok)
         rt_small_sums(p->rt_host, row, in->w, in->h, bps, p->rt_row, sums);
@@ -1447,6 +1448,8 @@ static bool rt_add(struct mp_filter *vf, struct mp_image *f, int64_t idx)
     if (!work)
         return false;
     if (!rt_metric(vf, f, p->rt_sums_new)) {
+        // rt_metric synchronized the stream (completing the queued copy)
+        // whenever the context could be made current at all
         talloc_free(work);
         return false;
     }
@@ -1498,10 +1501,28 @@ static struct mp_image *rt_render_interp(struct mp_filter *vf,
     return img;
 }
 
+// Re-timing could not set a frame up (copy / readback): carry on with the
+// plain RIFE grid from the current frame rather than fail the whole filter.
+// A later reconfigure tries re-timing again.
+static void rt_fall_back(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    MP_WARN(vf, "retime: frame setup failed; falling back to plain RIFE\n");
+    rt_reset(vf);
+    p->rt_on = false;
+    mp_refqueue_set_refs(p->queue, 0, p->depth - 1);
+    mp_filter_internal_mark_progress(vf);
+}
+
 static void rt_process(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
     const struct rt_params *rp = &p->rt;
+
+    // Pipelined upscale-only work queued before a reconfigure would be
+    // popped by upscale_image() in place of this chain's frames.
+    if (p->ring_n)
+        clear_ring(vf);
 
     // Records for the window: the current frame and up to maxhold futures
     // (fewer only at the end of the stream, or before a format change).
@@ -1514,14 +1535,14 @@ static void rt_process(struct mp_filter *vf)
         if (idx <= p->rt_last) {
             struct rt_frame *r = rt_rec(p, idx);
             if (!r || r->ident != f) {
-                // The refqueue restarted without a reset (EOF flush).
-                MP_VERBOSE(vf, "retime: input restarted; new ring\n");
+                // Defensive: the window no longer matches the records.
+                MP_WARN(vf, "retime: frame window out of sync; new ring\n");
                 rt_reset(vf);
                 rel = -1;
                 continue;
             }
         } else if (!rt_add(vf, f, idx)) {
-            mp_filter_internal_mark_failed(vf);
+            rt_fall_back(vf);
             return;
         }
         ahead = rel;
@@ -1615,6 +1636,10 @@ static void rt_process(struct mp_filter *vf)
         }
     }
     mp_refqueue_write_out_pin(p->queue, list[0]);
+    // That was the stream's last frame (EOF, or a format change drained the
+    // queue): whatever arrives next starts a new stream at index 0.
+    if (ahead == 0)
+        rt_reset(vf);
 }
 
 static void vf_animejanai_process(struct mp_filter *vf)
