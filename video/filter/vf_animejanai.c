@@ -28,6 +28,12 @@
  *
  * Runtime: `vf-command animejanai slot <N>` switches the active slot.
  *
+ * rife-retime=yes re-times RIFE for held anime drawings: instead of
+ * interpolating each consecutive source pair, the output grid morphs from
+ * one drawing to the next across the whole hold (vf_animejanai_retime.h).
+ * Same output count and timestamps as plain RIFE; it needs retime-maxhold
+ * frames of lookahead, kept as filter-owned copies (CUDA frames only).
+ *
  * This file is part of mpv.
  *
  * mpv is free software; you can redistribute it and/or
@@ -44,6 +50,7 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 
 #include "config.h"
@@ -76,6 +83,7 @@
 #include "video/mp_image_pool.h"
 
 #include "aji.h"
+#include "vf_animejanai_retime.h"
 
 #ifdef _WIN32
 #define AJI_DEFAULT_LIB "aji.dll"
@@ -148,9 +156,15 @@ struct opts {
     bool skip_seek_pre_target;
     bool output_444;
     int queue_depth;
+    bool rife_retime;
+    double retime_hold;
+    int retime_maxhold;
 };
 
 #define MAX_DEPTH 4
+
+// Re-timing ring: frames p - (maxhold - 1) .. p + maxhold by stream index.
+#define RT_RING (2 * RT_MAXHOLD_MAX + 2)
 
 struct aji_api {
     void *handle;
@@ -275,6 +289,31 @@ struct priv {
     AVBufferRef *work_pool;          // work-res frames (interp temps + the
                                      // pre-RIFE downscale output); only used
                                      // when has_pre_resize
+
+    // RIFE re-timing (rife-retime=yes; CUDA, integer factor, RIFE-first or
+    // RIFE-only chains). The refqueue holds the current frame plus maxhold
+    // future frames; every frame entering that window gets a record with a
+    // filter-owned copy (the RIFE endpoint / upscale input, so no decoder
+    // surface stays pinned once it leaves the window) and its hold metric.
+    // Stream indices restart at 0 on every reset (seek), reinit and
+    // reconfigure.
+    bool rt_on;
+    struct rt_params rt;
+    int64_t rt_base;            // stream index of refqueue position 0
+    int64_t rt_last;            // newest index with a record, -1 if none
+    struct rt_frame {
+        int64_t idx;            // stream index, -1 = empty
+        struct mp_image *ident; // refqueue frame (identity check only)
+        struct mp_image *work;  // owned: RIFE endpoint, upscale input
+        double pts;
+        double mad;             // transition idx - 1 -> idx (idx >= 1)
+    } rt_ring[RT_RING];
+    uint64_t *rt_sums;          // 192x108 sums of frame rt_last
+    uint64_t *rt_sums_new;
+    uint64_t *rt_row;
+    uint8_t *rt_host;           // luma readback
+    size_t rt_host_size;
+    int64_t rt_sc_a, rt_sc_b;   // the morph pair whose scene test fired
 };
 
 static int check_cu(struct mp_filter *vf, CUresult err, const char *func)
@@ -386,6 +425,22 @@ static void drain_backend(struct mp_filter *vf)
     }
 }
 
+// Drop the re-timing ring: stream indices restart at the refqueue's current
+// frame. All GPU work on the records' frames is synchronous (copies are
+// waited by the metric readback, RIFE/upscale calls wait), so they can go.
+static void rt_reset(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    for (int i = 0; i < RT_RING; i++) {
+        mp_image_unrefp(&p->rt_ring[i].work);
+        p->rt_ring[i].idx = -1;
+        p->rt_ring[i].ident = NULL;
+    }
+    p->rt_base = 0;
+    p->rt_last = -1;
+    p->rt_sc_a = p->rt_sc_b = -1;
+}
+
 static void flush_frames(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
@@ -396,6 +451,7 @@ static void flush_frames(struct mp_filter *vf)
     // in the upscaler ring. Drain the backend before releasing frame pools on
     // seek/reset so old work cannot contend with the post-seek chain.
     drain_backend(vf);
+    rt_reset(vf);
     mp_refqueue_flush(p->queue);
     mp_image_unrefp(&p->rife_prev);
     for (int i = 0; i < p->outq_n; i++)
@@ -433,12 +489,48 @@ static void write_stats(struct mp_filter *vf)
 // as do bypass and passthrough; active upscale chains run queue-depth
 // frames deep, with the refqueue's future-ref window supplying the
 // read-ahead (depth - 1 buffered future frames).
+// Re-timing runs for integer-factor RIFE on CUDA frames that interpolates
+// source-resolution frames (RIFE-first, or a RIFE-only chain); otherwise the
+// plain RIFE grid runs. Called on every (re)configure; restarts the ring.
+static void rt_configure(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    rt_reset(vf);
+    p->rt_on = false;
+    if (!p->opts->rife_retime || !p->rife_on)
+        return;
+    const char *why = p->is_d3d11 ? "needs CUDA frames" :
+                      p->rife_den != 1 ? "needs an integer RIFE factor" :
+                      (p->aji_active && !p->rife_first)
+                          ? "needs RIFE before the upscale" : NULL;
+    if (why) {
+        MP_WARN(vf, "rife-retime %s; using plain RIFE\n", why);
+        return;
+    }
+    if (!p->rt_sums) {
+        p->rt_sums = talloc_array(p, uint64_t, RT_SMALL_N);
+        p->rt_sums_new = talloc_array(p, uint64_t, RT_SMALL_N);
+        p->rt_row = talloc_array(p, uint64_t, RT_SMALL_W);
+    }
+    p->rt = (struct rt_params){
+        .factor = p->rife_num,
+        .maxhold = MPCLAMP(p->opts->retime_maxhold, 1, RT_MAXHOLD_MAX),
+        .hold = p->opts->retime_hold,
+        .guard = RT_GUARD,
+    };
+    p->rt_on = true;
+    MP_VERBOSE(vf, "RIFE re-timing: %dx, hold below MAD %g, holds up to %d "
+               "frames\n", p->rt.factor, p->rt.hold, p->rt.maxhold);
+}
+
 static void update_depth(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
     int depth = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
     p->depth = (p->aji_active && !p->rife_on) ? depth : 1;
-    mp_refqueue_set_refs(p->queue, 0, p->depth - 1);
+    rt_configure(vf);
+    // Re-timing plans each frame with maxhold frames of lookahead.
+    mp_refqueue_set_refs(p->queue, 0, p->rt_on ? p->rt.maxhold : p->depth - 1);
 }
 
 // (Re)configure the shim for the current stream params and slot. Updates
@@ -931,11 +1023,11 @@ done:
 
 // Interpolate between two upscaled frames at time point t. Returns the
 // interpolated image, a new ref of `a` on a scene change (the reference
-// pipeline substitutes the left frame), or NULL on error. pts is left for
-// the caller to set.
+// pipeline substitutes the left frame; *scene is then set if non-NULL), or
+// NULL on error. pts is left for the caller to set.
 static struct mp_image *render_interp(struct mp_filter *vf,
                                       struct mp_image *a, struct mp_image *b,
-                                      double t)
+                                      double t, bool *scene)
 {
     struct priv *p = vf->priv;
     CUcontext dummy;
@@ -970,6 +1062,8 @@ static struct mp_image *render_interp(struct mp_filter *vf,
     }
     int ret = p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
+        if (scene)
+            *scene = true;
         talloc_free(out);
         return mp_image_new_ref(a);
     }
@@ -1163,10 +1257,11 @@ static struct mp_image *downscale_src(struct mp_filter *vf,
 // RIFE-first: interpolate two work-resolution frames at time t into a fresh
 // work-resolution frame (the caller upscales it). Without a pre-RIFE downscale
 // the work res equals the source res. Returns a new ref of `a` on a scene
-// change, NULL on error. pts is left for the caller.
+// change (*scene is then set if non-NULL), NULL on error. pts is left for
+// the caller.
 static struct mp_image *interp_source(struct mp_filter *vf,
                                       struct mp_image *a, struct mp_image *b,
-                                      double t)
+                                      double t, bool *scene)
 {
     struct priv *p = vf->priv;
     CUcontext dummy;
@@ -1198,6 +1293,8 @@ static struct mp_image *interp_source(struct mp_filter *vf,
 
     int ret = p->api.infer_rife(p->aji, &fa, &fb, t, &fout, p->stream);
     if (ret == AJI_SCENE) {
+        if (scene)
+            *scene = true;
         talloc_free(out);
         return mp_image_new_ref(a);
     }
@@ -1224,6 +1321,300 @@ static struct mp_image *upscale_image(struct mp_filter *vf,
     if (!submit_frame(vf, in))
         return NULL;
     return pop_ring(vf);
+}
+
+// ---------------------------------------------------------------------------
+// RIFE re-timing (rife-retime=yes). Each process() call plans the refqueue's
+// current frame `pos` with vf_animejanai_retime.h and emits its `factor`
+// output slots on the plain RIFE grid (pts(pos) + k/factor of the step to
+// the next frame): source slots show the (upscaled) frame pos, interpolated
+// slots RIFE(a, b, t) between records of the window.
+// ---------------------------------------------------------------------------
+
+static struct rt_frame *rt_rec(struct priv *p, int64_t idx)
+{
+    if (idx < 0)
+        return NULL;
+    struct rt_frame *r = &p->rt_ring[idx % RT_RING];
+    return r->idx == idx ? r : NULL;
+}
+
+static double rt_mad(void *ctx, int64_t i)
+{
+    struct mp_filter *vf = ctx;
+    struct rt_frame *r = rt_rec(vf->priv, i);
+    if (!r) {
+        // Planner window contract broken (a bug): never morph on it.
+        MP_ERR(vf, "retime: no metric for frame %" PRId64 "\n", i);
+        return 0.0;
+    }
+    return r->mad;
+}
+
+// Filter-owned copy of a CUDA frame: RIFE-first interpolates and upscales
+// source-res frames from src_pool; a RIFE-only chain outputs the copies
+// themselves (hw_pool, out_params == params). The copy is ordered on
+// p->stream before every later use of the frame.
+static struct mp_image *rt_copy(struct mp_filter *vf, struct mp_image *in)
+{
+    struct priv *p = vf->priv;
+    CUcontext dummy;
+
+    struct mp_image *out = p->rife_first ? alloc_src(vf) : alloc_out(vf);
+    if (!out)
+        return NULL;
+    mp_image_copy_attributes(out, in);
+    out->params = p->rife_first ? p->params : p->out_params;
+    out->pts = in->pts;
+
+    if (!order_after_decode(vf) ||
+        CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0) {
+        talloc_free(out);
+        return NULL;
+    }
+    bool ok = true;
+    for (int n = 0; ok && n < p->layout.fmt.num_planes; n++) {
+        CUDA_MEMCPY2D cpy = {
+            .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+            .srcDevice     = (CUdeviceptr)(uintptr_t)in->planes[n],
+            .srcPitch      = in->stride[n],
+            .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+            .dstDevice     = (CUdeviceptr)(uintptr_t)out->planes[n],
+            .dstPitch      = out->stride[n],
+            .WidthInBytes  = mp_image_plane_w(&p->layout, n) *
+                             p->layout.fmt.bpp[n] / 8,
+            .Height        = mp_image_plane_h(&p->layout, n),
+        };
+        ok = CHECK_CU(p->cu->cuMemcpy2DAsync(&cpy, p->stream)) >= 0;
+    }
+    if (!ok)  // don't free a frame a queued copy may still write
+        CHECK_CU(p->cu->cuStreamSynchronize(p->stream));
+    CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
+    if (!ok)
+        TA_FREEP(&out);
+    return out;
+}
+
+// Hold metric input: read the source luma plane back and area-average it
+// to 192x108 sums. Synchronizes p->stream (which also completes the frame's
+// copy / pre-RIFE downscale queued before it).
+static bool rt_metric(struct mp_filter *vf, struct mp_image *in,
+                      uint64_t *sums)
+{
+    struct priv *p = vf->priv;
+    CUcontext dummy;
+
+    const int bps = (p->layout.fmt.bpp[0] + 7) / 8;  // 1: 8-bit, 2: 16-bit
+    const size_t row = (size_t)in->w * bps;
+    const size_t need = row * in->h;
+    if (p->rt_host_size < need) {
+        talloc_free(p->rt_host);
+        p->rt_host = talloc_size(p, need);
+        p->rt_host_size = need;
+    }
+    CUDA_MEMCPY2D cpy = {
+        .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+        .srcDevice     = (CUdeviceptr)(uintptr_t)in->planes[0],
+        .srcPitch      = in->stride[0],
+        .dstMemoryType = CU_MEMORYTYPE_HOST,
+        .dstHost       = p->rt_host,
+        .dstPitch      = row,
+        .WidthInBytes  = row,
+        .Height        = in->h,
+    };
+    if (!order_after_decode(vf) ||
+        CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0)
+        return false;
+    bool ok = CHECK_CU(p->cu->cuMemcpy2DAsync(&cpy, p->stream)) >= 0 &&
+              CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
+    CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
+    if (ok)
+        rt_small_sums(p->rt_host, row, in->w, in->h, bps, p->rt_row, sums);
+    return ok;
+}
+
+// Record a frame entering the window as stream index idx (== rt_last + 1).
+static bool rt_add(struct mp_filter *vf, struct mp_image *f, int64_t idx)
+{
+    struct priv *p = vf->priv;
+    struct rt_frame *r = &p->rt_ring[idx % RT_RING];
+    mp_image_unrefp(&r->work);
+    r->idx = -1;
+    r->ident = NULL;
+
+    struct mp_image *work = p->has_pre_resize ? downscale_src(vf, f)
+                                              : rt_copy(vf, f);
+    if (!work)
+        return false;
+    if (!rt_metric(vf, f, p->rt_sums_new)) {
+        talloc_free(work);
+        return false;
+    }
+    double mad = 0.0;
+    if (idx > 0 && p->rt_last != idx - 1) {
+        // rt_process() adds frames in order; never abort playback over it
+        MP_ERR(vf, "retime: frame %" PRId64 " out of order\n", idx);
+    } else if (idx > 0) {
+        const int bps = (p->layout.fmt.bpp[0] + 7) / 8;
+        const bool limited = map_range(&p->params) == AJI_RANGE_LIMITED;
+        mad = rt_small_mad(p->rt_sums, p->rt_sums_new, f->w, f->h,
+                           rt_luma_scale(8 * bps, limited));
+    }
+    MPSWAP(uint64_t *, p->rt_sums, p->rt_sums_new);
+    *r = (struct rt_frame){
+        .idx = idx, .ident = f, .work = work, .pts = f->pts, .mad = mad,
+    };
+    p->rt_last = idx;
+    MP_DBG(vf, "retime: frame %" PRId64 " pts=%f mad=%.17g\n", idx, f->pts,
+           mad);
+    return true;
+}
+
+static struct mp_image *rt_render_src(struct mp_filter *vf, struct rt_frame *r)
+{
+    struct priv *p = vf->priv;
+    return p->rife_first ? upscale_image(vf, r->work)
+                         : mp_image_new_ref(r->work);
+}
+
+// RIFE(a, b, t), upscaled when RIFE-first. NULL with *scene set on a scene
+// change, NULL alone on error.
+static struct mp_image *rt_render_interp(struct mp_filter *vf,
+                                         struct rt_frame *ra,
+                                         struct rt_frame *rb, double t,
+                                         bool *scene)
+{
+    struct priv *p = vf->priv;
+    struct mp_image *img;
+    if (p->rife_first) {
+        struct mp_image *tmp = interp_source(vf, ra->work, rb->work, t, scene);
+        img = tmp && !*scene ? upscale_image(vf, tmp) : NULL;
+        mp_image_unrefp(&tmp);
+    } else {
+        img = render_interp(vf, ra->work, rb->work, t, scene);
+    }
+    if (*scene)
+        mp_image_unrefp(&img);
+    return img;
+}
+
+static void rt_process(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    const struct rt_params *rp = &p->rt;
+
+    // Records for the window: the current frame and up to maxhold futures
+    // (fewer only at the end of the stream, or before a format change).
+    int ahead = -1;
+    for (int rel = 0; rel <= rp->maxhold; rel++) {
+        struct mp_image *f = mp_refqueue_get(p->queue, rel);
+        if (!f)
+            break;
+        const int64_t idx = p->rt_base + rel;
+        if (idx <= p->rt_last) {
+            struct rt_frame *r = rt_rec(p, idx);
+            if (!r || r->ident != f) {
+                // The refqueue restarted without a reset (EOF flush).
+                MP_VERBOSE(vf, "retime: input restarted; new ring\n");
+                rt_reset(vf);
+                rel = -1;
+                continue;
+            }
+        } else if (!rt_add(vf, f, idx)) {
+            mp_filter_internal_mark_failed(vf);
+            return;
+        }
+        ahead = rel;
+    }
+    if (ahead < 0)
+        return;
+
+    const int64_t pos = p->rt_base;
+    const int64_t n = ahead < rp->maxhold ? pos + ahead + 1 : RT_N_UNKNOWN;
+    const struct rt_plan plan = rt_plan(rp, pos, n, rt_mad, vf);
+    struct rt_frame *cur = rt_rec(p, pos);
+    struct rt_frame *nxt = ahead >= 1 ? rt_rec(p, pos + 1) : NULL;
+    const double in_fps = mp_refqueue_get(p->queue, 0)->nominal_fps;
+
+    // The output grid: factor slots from pos up to the next frame; the
+    // stream's last frame (or one without usable timestamps) emits only
+    // itself, like the plain RIFE grid.
+    int slots = rp->factor;
+    if (!nxt || cur->pts == MP_NOPTS_VALUE || nxt->pts == MP_NOPTS_VALUE ||
+        nxt->pts <= cur->pts)
+        slots = 1;
+
+    // The scene test belongs to the pair: once it fired, every position of
+    // the span shows its source frame without asking RIFE again.
+    bool scene = plan.kind != RT_PLAN_HOLD && plan.a == p->rt_sc_a &&
+                 plan.b == p->rt_sc_b;
+    struct mp_image *list[RT_FACTOR_MAX];
+    int cnt = 0;
+    struct mp_image *src = NULL;  // frame pos as output, shared by its slots
+    for (int k = 0; k < slots; k++) {
+        struct rt_step st = rt_slot(rp, &plan, pos, k, scene);
+        struct mp_image *img = NULL;
+        if (st.interp) {
+            struct rt_frame *ra = rt_rec(p, st.a), *rb = rt_rec(p, st.b);
+            bool sc = false;
+            img = ra && rb ? rt_render_interp(vf, ra, rb, st.t, &sc) : NULL;
+            if (sc) {
+                MP_DBG(vf, "retime: scene a=%" PRId64 " b=%" PRId64 "\n",
+                       plan.a, plan.b);
+                p->rt_sc_a = plan.a;
+                p->rt_sc_b = plan.b;
+                scene = true;
+            } else if (!img) {
+                MP_WARN(vf, "retime: interpolation failed; showing the "
+                            "source frame\n");
+            }
+            if (!img)
+                st = (struct rt_step){false, pos, -1, 0.0};
+        }
+        if (!img) {  // a source slot: always frame pos (rt_slot)
+            if (!src)
+                src = rt_render_src(vf, cur);
+            if (!src)
+                break;
+            img = mp_image_new_ref(src);
+        }
+        img->pts = k == 0 ? cur->pts
+                 : cur->pts + (nxt->pts - cur->pts) * ((double)k / rp->factor);
+        if (in_fps > 0)
+            img->nominal_fps = in_fps * rp->factor;
+        if (st.interp) {
+            MP_DBG(vf, "retime: out %" PRId64 ".%d interp a=%" PRId64
+                   " b=%" PRId64 " t=%.17g pts=%f\n", pos, k, st.a, st.b,
+                   st.t, img->pts);
+        } else {
+            MP_DBG(vf, "retime: out %" PRId64 ".%d src %" PRId64 " pts=%f\n",
+                   pos, k, pos, img->pts);
+        }
+        list[cnt++] = img;
+    }
+    mp_image_unrefp(&src);
+    if (cnt < slots) {
+        for (int i = 0; i < cnt; i++)
+            mp_image_unrefp(&list[i]);
+        mp_filter_internal_mark_failed(vf);
+        return;
+    }
+
+    for (int i = 1; i < cnt; i++)
+        p->outq[p->outq_n++] = list[i];
+    p->outq_pos = 0;
+    // The refqueue moves on to pos + 1; drop records no later plan reads.
+    p->rt_base++;
+    const int64_t keep = p->rt_base - rt_behind(rp);
+    for (int i = 0; i < RT_RING; i++) {
+        struct rt_frame *r = &p->rt_ring[i];
+        if (r->idx >= 0 && r->idx < keep) {
+            mp_image_unrefp(&r->work);
+            r->idx = -1;
+            r->ident = NULL;
+        }
+    }
+    mp_refqueue_write_out_pin(p->queue, list[0]);
 }
 
 static void vf_animejanai_process(struct mp_filter *vf)
@@ -1483,6 +1874,11 @@ static void vf_animejanai_process(struct mp_filter *vf)
     if (!mp_refqueue_can_output(p->queue))
         return;
 
+    if (p->rt_on) {
+        rt_process(vf);
+        return;
+    }
+
     if (p->rife_first) {
         // RIFE-first: interpolate the source pair, then upscale each emitted
         // frame. Same output-grid cadence as the default path below, but
@@ -1525,7 +1921,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 } else {
                     double t = (double)p->rife_acc / p->rife_num;
                     struct mp_image *tmp =
-                        interp_source(vf, p->rife_prev, cur_src, t);
+                        interp_source(vf, p->rife_prev, cur_src, t, NULL);
                     frame = tmp ? upscale_image(vf, tmp) : NULL;
                     mp_image_unrefp(&tmp);
                     pts = p->rife_prev->pts +
@@ -1628,7 +2024,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 } else {
                     double t = (double)p->rife_acc / p->rife_num;
                     struct mp_image *ip =
-                        render_interp(vf, p->rife_prev, out, t);
+                        render_interp(vf, p->rife_prev, out, t, NULL);
                     if (!ip) {
                         failed = true;  // degrade to fewer frames
                         break;
@@ -1783,6 +2179,7 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     p->opts = talloc_steal(p, options);
     p->queue = mp_refqueue_alloc(f);
     p->cur_slot = p->pending_slot = p->opts->slot;
+    rt_reset(f);
 
     // Expand mpv path shortcuts (~~/ etc.) so portable configs can point at
     // files relative to the config directory (suboptions are not expanded
@@ -1888,6 +2285,9 @@ static const m_option_t vf_opts_fields[] = {
     {"skip-seek-pre-target", OPT_BOOL(skip_seek_pre_target)},
     {"output-444", OPT_BOOL(output_444)},
     {"queue-depth", OPT_INT(queue_depth), M_RANGE(1, MAX_DEPTH)},
+    {"rife-retime", OPT_BOOL(rife_retime)},
+    {"retime-hold", OPT_DOUBLE(retime_hold), M_RANGE(0, 255)},
+    {"retime-maxhold", OPT_INT(retime_maxhold), M_RANGE(1, RT_MAXHOLD_MAX)},
     {0}
 };
 
@@ -1902,6 +2302,8 @@ const struct mp_user_filter_entry vf_animejanai = {
             .skip_seek_pre_target = true,
             .output_444 = true,
             .queue_depth = 3,
+            .retime_hold = RT_HOLD_DEFAULT,
+            .retime_maxhold = RT_MAXHOLD_DEFAULT,
         },
         .options = vf_opts_fields,
     },
