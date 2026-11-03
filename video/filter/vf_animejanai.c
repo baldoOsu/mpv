@@ -33,6 +33,11 @@
  * one drawing to the next across the whole hold (vf_animejanai_retime.h).
  * Same output count and timestamps as plain RIFE; it needs retime-maxhold
  * frames of lookahead, kept as filter-owned copies (CUDA frames only).
+ * retime-camera=yes adds the worker's camera mode: a frame that is held once
+ * the global shift (phase correlation, vf_animejanai_camera.h) is undone
+ * counts as held inside a short, near-linear camera span, so RIFE also
+ * spreads across pans over held drawings. The metric runs on a helper
+ * thread, one frame of lookahead ahead of the planner.
  *
  * This file is part of mpv.
  *
@@ -83,6 +88,8 @@
 #include "video/mp_image_pool.h"
 
 #include "aji.h"
+#include "osdep/threads.h"
+#include "vf_animejanai_camera.h"
 #include "vf_animejanai_retime.h"
 
 #ifdef _WIN32
@@ -159,13 +166,19 @@ struct opts {
     bool rife_retime;
     double retime_hold;
     int retime_maxhold;
+    bool retime_camera;
+    int retime_maxcam;
 };
 
 #define MAX_DEPTH 4
 
 // Re-timing ring, by stream index: the records of frames p - rt_behind() ..
-// p + rt_ahead() (vf_animejanai_retime.h), plus one spare.
-#define RT_RING (RT_BEHIND_MAX + 1 + RT_AHEAD_MAX + 1)
+// p + rt_ahead() (vf_animejanai_retime.h), camera mode's extra lookahead
+// frame, plus one spare.
+#define RT_RING (RT_BEHIND_MAX + 1 + RT_AHEAD_MAX + 1 + 1)
+
+// Camera metric jobs in flight (each holds one frame's luma readback).
+#define RT_CAM_JOBS 3
 
 struct aji_api {
     void *handle;
@@ -310,6 +323,7 @@ struct priv {
         struct mp_image *work;  // owned: RIFE endpoint, upscale input
         double pts;
         struct rt_trans tr;     // transition idx - 1 -> idx (idx >= 1)
+        bool cam_pending;       // camera mode: tr's camera fields not in yet
     } rt_ring[RT_RING];
     uint64_t *rt_sums;          // 192x108 sums of frame rt_last
     uint64_t *rt_sums_new;
@@ -317,6 +331,42 @@ struct priv {
     uint8_t *rt_host;           // luma readback
     size_t rt_host_size;
     int64_t rt_sc_a, rt_sc_b;   // the morph pair whose scene test fired
+    // Camera mode (retime-camera=yes): the phase correlation runs on a
+    // helper thread (struct rt_cam), created on first use.
+    struct rt_cam *rt_cam;
+};
+
+// Camera metric helper. The filter thread reads each frame's luma back
+// (rt_metric), computes its hold MAD, and queues the frame; the helper
+// thread computes the camera fields of the transition into it
+// (rc_transition) while the filter renders. The refqueue holds one future
+// frame more than the planner reads, so the newest frame's result is only
+// needed one process() call later. Jobs are a FIFO by sequence number:
+// [collected, head) done, [head, tail) queued; the filter thread owns tail
+// and collected, the helper head; all three under lock.
+struct rt_cam_job {
+    int64_t idx;                // stream index of the frame
+    double mad, hold;           // its hold MAD; the hold threshold
+    uint8_t *luma;              // packed luma readback (filter-owned)
+    size_t size;
+    int w, h, bps;
+    double scale;
+    struct rc_trans out;        // the helper's result
+};
+
+struct rt_cam {
+    mp_thread thread;
+    mp_mutex lock;
+    mp_cond wakeup;             // work queued, a job done, or quit
+    bool quit;
+    uint64_t tail, head, collected;
+    struct rt_cam_job job[RT_CAM_JOBS];
+    // helper thread only
+    struct rc_ctx *ctx;
+    struct rc_work *wk;
+    struct rc_frame *fr[2];
+    int prev;                   // fr[] index of the previous frame, -1 none
+    int64_t prev_idx;
 };
 
 static int check_cu(struct mp_filter *vf, CUresult err, const char *func)
@@ -431,9 +481,12 @@ static void drain_backend(struct mp_filter *vf)
 // Drop the re-timing ring: stream indices restart at the refqueue's current
 // frame. All GPU work on the records' frames is synchronous (copies are
 // waited by the metric readback, RIFE/upscale calls wait), so they can go.
+static void rt_cam_drain(struct mp_filter *vf);
+
 static void rt_reset(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
+    rt_cam_drain(vf);
     for (int i = 0; i < RT_RING; i++) {
         mp_image_unrefp(&p->rt_ring[i].work);
         p->rt_ring[i].idx = -1;
@@ -495,6 +548,8 @@ static void write_stats(struct mp_filter *vf)
 // Re-timing runs for integer-factor RIFE on CUDA frames that interpolates
 // source-resolution frames (RIFE-first, or a RIFE-only chain); otherwise the
 // plain RIFE grid runs. Called on every (re)configure; restarts the ring.
+static bool rt_cam_create(struct mp_filter *vf);
+
 static void rt_configure(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
@@ -520,10 +575,30 @@ static void rt_configure(struct mp_filter *vf)
         .maxhold = MPCLAMP(p->opts->retime_maxhold, 1, RT_MAXHOLD_MAX),
         .hold = p->opts->retime_hold,
         .guard = RT_GUARD,
+        .camera = p->opts->retime_camera,
+        .maxcam = MPCLAMP(p->opts->retime_maxcam, 1, RT_MAXCAM_MAX),
     };
+    if (p->rt.camera && !p->rt_cam && !rt_cam_create(vf)) {
+        MP_WARN(vf, "retime-camera: cannot start the camera metric; "
+                    "re-timing without it\n");
+        p->rt.camera = false;
+    }
     p->rt_on = true;
-    MP_VERBOSE(vf, "RIFE re-timing: %dx, hold below MAD %g, holds up to %d "
-               "frames\n", p->rt.factor, p->rt.hold, p->rt.maxhold);
+    if (p->rt.camera) {
+        MP_VERBOSE(vf, "RIFE re-timing: %dx, hold below MAD %g, holds up to "
+                   "%d frames, camera spans up to %d frames\n", p->rt.factor,
+                   p->rt.hold, p->rt.maxhold, rt_maxcam(&p->rt));
+    } else {
+        MP_VERBOSE(vf, "RIFE re-timing: %dx, hold below MAD %g, holds up to "
+                   "%d frames\n", p->rt.factor, p->rt.hold, p->rt.maxhold);
+    }
+}
+
+// Refqueue frames after the current one that re-timing keeps: what the
+// planner reads, plus the frame whose camera metric is still running.
+static int rt_queue_ahead(const struct rt_params *rp)
+{
+    return rt_ahead(rp) + (rp->camera ? 1 : 0);
 }
 
 static void update_depth(struct mp_filter *vf)
@@ -533,7 +608,7 @@ static void update_depth(struct mp_filter *vf)
     p->depth = (p->aji_active && !p->rife_on) ? depth : 1;
     rt_configure(vf);
     // Re-timing plans each frame with rt_ahead() frames of lookahead.
-    mp_refqueue_set_refs(p->queue, 0, p->rt_on ? rt_ahead(&p->rt)
+    mp_refqueue_set_refs(p->queue, 0, p->rt_on ? rt_queue_ahead(&p->rt)
                                                : p->depth - 1);
 }
 
@@ -1352,6 +1427,8 @@ static struct rt_trans rt_get(void *ctx, int64_t i)
         MP_ERR(vf, "retime: no metric for frame %" PRId64 "\n", i);
         return (struct rt_trans){.mad = 0.0};
     }
+    if (r->cam_pending)  // a bug: rt_process() collects the window first
+        MP_ERR(vf, "retime: camera metric of frame %" PRId64 " missing\n", i);
     return r->tr;
 }
 
@@ -1403,8 +1480,11 @@ static struct mp_image *rt_copy(struct mp_filter *vf, struct mp_image *in)
 // to 192x108 sums. Runs right after the frame's copy / pre-RIFE downscale,
 // which already ordered p->stream after its decode; synchronizes p->stream
 // (completing that copy too).
+// The luma lands packed (stride w * bytes per sample) in *host, which grows
+// as needed (talloc child of ta_parent).
 static bool rt_metric(struct mp_filter *vf, struct mp_image *in,
-                      uint64_t *sums)
+                      uint64_t *sums, void *ta_parent, uint8_t **host,
+                      size_t *host_size)
 {
     struct priv *p = vf->priv;
     CUcontext dummy;
@@ -1412,17 +1492,17 @@ static bool rt_metric(struct mp_filter *vf, struct mp_image *in,
     const int bps = (p->layout.fmt.bpp[0] + 7) / 8;  // 1: 8-bit, 2: 16-bit
     const size_t row = (size_t)in->w * bps;
     const size_t need = row * in->h;
-    if (p->rt_host_size < need) {
-        talloc_free(p->rt_host);
-        p->rt_host = talloc_size(p, need);
-        p->rt_host_size = need;
+    if (*host_size < need) {
+        talloc_free(*host);
+        *host = talloc_size(ta_parent, need);
+        *host_size = need;
     }
     CUDA_MEMCPY2D cpy = {
         .srcMemoryType = CU_MEMORYTYPE_DEVICE,
         .srcDevice     = (CUdeviceptr)(uintptr_t)in->planes[0],
         .srcPitch      = in->stride[0],
         .dstMemoryType = CU_MEMORYTYPE_HOST,
-        .dstHost       = p->rt_host,
+        .dstHost       = *host,
         .dstPitch      = row,
         .WidthInBytes  = row,
         .Height        = in->h,
@@ -1434,8 +1514,178 @@ static bool rt_metric(struct mp_filter *vf, struct mp_image *in,
     ok &= CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
     CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
     if (ok)
-        rt_small_sums(p->rt_host, row, in->w, in->h, bps, p->rt_row, sums);
+        rt_small_sums(*host, row, in->w, in->h, bps, p->rt_row, sums);
     return ok;
+}
+
+// --- camera metric helper (struct rt_cam) ---------------------------------
+
+static MP_THREAD_VOID rt_cam_thread(void *arg)
+{
+    struct rt_cam *c = arg;
+    mp_thread_set_name("aji-retime-cam");
+    mp_mutex_lock(&c->lock);
+    while (!c->quit) {
+        if (c->head == c->tail) {
+            mp_cond_wait(&c->wakeup, &c->lock);
+            continue;
+        }
+        struct rt_cam_job *j = &c->job[c->head % RT_CAM_JOBS];
+        mp_mutex_unlock(&c->lock);
+        // The job's inputs are not touched by the filter while queued.
+        const int cur = c->prev == 0 ? 1 : 0;
+        const bool ok = rc_frame_set_luma(c->fr[cur], j->luma,
+                                          (ptrdiff_t)j->w * j->bps, j->w,
+                                          j->h, j->bps, j->scale, c->wk);
+        struct rc_trans out = {0};
+        // Stream indices restart at 0 after a reset: frame 0 has no
+        // transition into it.
+        if (ok && j->idx > 0 && c->prev >= 0 && c->prev_idx == j->idx - 1) {
+            out = rc_transition(c->ctx, c->fr[c->prev], c->fr[cur], j->mad,
+                                j->hold, c->wk, NULL);
+        }
+        c->prev = ok ? cur : -1;
+        c->prev_idx = j->idx;
+        mp_mutex_lock(&c->lock);
+        j->out = out;
+        c->head++;
+        mp_cond_broadcast(&c->wakeup);
+    }
+    mp_mutex_unlock(&c->lock);
+    MP_THREAD_RETURN();
+}
+
+static void rt_cam_free(struct rt_cam *c)
+{
+    for (int i = 0; i < 2; i++)
+        rc_frame_destroy(c->fr[i]);
+    rc_work_destroy(c->wk);
+    rc_ctx_destroy(c->ctx);
+    mp_cond_destroy(&c->wakeup);
+    mp_mutex_destroy(&c->lock);
+    talloc_free(c);
+}
+
+static bool rt_cam_create(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    struct rt_cam *c = talloc_zero(NULL, struct rt_cam);
+    mp_mutex_init(&c->lock);
+    mp_cond_init(&c->wakeup);
+    c->prev = -1;
+    c->prev_idx = -1;
+    c->ctx = rc_ctx_create();
+    c->wk = rc_work_create();
+    c->fr[0] = rc_frame_create();
+    c->fr[1] = rc_frame_create();
+    if (!c->ctx || !c->wk || !c->fr[0] || !c->fr[1] ||
+        mp_thread_create(&c->thread, rt_cam_thread, c))
+    {
+        rt_cam_free(c);
+        return false;
+    }
+    p->rt_cam = c;
+    return true;
+}
+
+static void rt_cam_destroy(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    struct rt_cam *c = p->rt_cam;
+    if (!c)
+        return;
+    mp_mutex_lock(&c->lock);
+    c->quit = true;
+    mp_cond_broadcast(&c->wakeup);
+    mp_mutex_unlock(&c->lock);
+    mp_thread_join(c->thread);
+    rt_cam_free(c);
+    p->rt_cam = NULL;
+}
+
+// Move finished results into their records (c->lock held).
+static void rt_cam_store_done(struct mp_filter *vf, struct rt_cam *c)
+{
+    struct priv *p = vf->priv;
+    for (; c->collected < c->head; c->collected++) {
+        const struct rt_cam_job *j = &c->job[c->collected % RT_CAM_JOBS];
+        struct rt_frame *r = rt_rec(p, j->idx);
+        if (!r || !r->cam_pending)
+            continue;
+        r->tr.has_shift = j->out.has_shift;
+        r->tr.dy = j->out.dy;
+        r->tr.dx = j->out.dx;
+        r->tr.camera_only = j->out.camera_only;
+        r->cam_pending = false;
+        if (r->tr.has_shift) {
+            MP_DBG(vf, "retime: frame %" PRId64 " pts=%f mad=%.17g shift=%d,%d "
+                   "cam=%d\n", r->idx, r->pts, r->tr.mad, r->tr.dy, r->tr.dx,
+                   r->tr.camera_only);
+        } else {
+            MP_DBG(vf, "retime: frame %" PRId64 " pts=%f mad=%.17g shift=none "
+                   "cam=0\n", r->idx, r->pts, r->tr.mad);
+        }
+    }
+}
+
+// Wait until every queued frame up to stream index upto has its camera
+// result, and store the results.
+static void rt_cam_collect(struct mp_filter *vf, int64_t upto)
+{
+    struct priv *p = vf->priv;
+    struct rt_cam *c = p->rt_cam;
+    mp_mutex_lock(&c->lock);
+    for (;;) {
+        rt_cam_store_done(vf, c);
+        if (c->head == c->tail || c->job[c->head % RT_CAM_JOBS].idx > upto)
+            break;
+        mp_cond_wait(&c->wakeup, &c->lock);
+    }
+    mp_mutex_unlock(&c->lock);
+}
+
+// Wait for the helper to finish everything queued and drop the results
+// (the ring is about to restart).
+static void rt_cam_drain(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    struct rt_cam *c = p->rt_cam;
+    if (!c)
+        return;
+    mp_mutex_lock(&c->lock);
+    while (c->head != c->tail)
+        mp_cond_wait(&c->wakeup, &c->lock);
+    c->collected = c->head;
+    mp_mutex_unlock(&c->lock);
+}
+
+// A free job slot (the next sequence number), waiting for the oldest job
+// if all are in flight. Only the filter thread writes it until queued.
+static struct rt_cam_job *rt_cam_slot(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    struct rt_cam *c = p->rt_cam;
+    mp_mutex_lock(&c->lock);
+    while (c->tail - c->collected >= RT_CAM_JOBS) {
+        if (c->collected < c->head) {
+            rt_cam_store_done(vf, c);
+        } else {
+            mp_cond_wait(&c->wakeup, &c->lock);
+        }
+    }
+    struct rt_cam_job *j = &c->job[c->tail % RT_CAM_JOBS];
+    mp_mutex_unlock(&c->lock);
+    return j;
+}
+
+static void rt_cam_queue(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+    struct rt_cam *c = p->rt_cam;
+    mp_mutex_lock(&c->lock);
+    c->tail++;
+    mp_cond_broadcast(&c->wakeup);
+    mp_mutex_unlock(&c->lock);
 }
 
 // Record a frame entering the window as stream index idx (== rt_last + 1).
@@ -1451,7 +1701,12 @@ static bool rt_add(struct mp_filter *vf, struct mp_image *f, int64_t idx)
                                               : rt_copy(vf, f);
     if (!work)
         return false;
-    if (!rt_metric(vf, f, p->rt_sums_new)) {
+    struct rt_cam_job *job = p->rt.camera ? rt_cam_slot(vf) : NULL;
+    bool got = job ? rt_metric(vf, f, p->rt_sums_new, p->rt_cam, &job->luma,
+                               &job->size)
+                   : rt_metric(vf, f, p->rt_sums_new, p, &p->rt_host,
+                               &p->rt_host_size);
+    if (!got) {
         // rt_metric synchronized the stream (completing the queued copy)
         // whenever the context could be made current at all
         talloc_free(work);
@@ -1470,11 +1725,25 @@ static bool rt_add(struct mp_filter *vf, struct mp_image *f, int64_t idx)
     MPSWAP(uint64_t *, p->rt_sums, p->rt_sums_new);
     *r = (struct rt_frame){
         .idx = idx, .ident = f, .work = work, .pts = f->pts,
-        .tr = {.mad = mad},
+        .tr = {.mad = mad}, .cam_pending = !!job,
     };
     p->rt_last = idx;
-    MP_DBG(vf, "retime: frame %" PRId64 " pts=%f mad=%.17g\n", idx, f->pts,
-           mad);
+    if (job) {
+        // camera fields follow from the helper (logged by rt_cam_collect)
+        const int bps = (p->layout.fmt.bpp[0] + 7) / 8;
+        const bool limited = map_range(&p->params) == AJI_RANGE_LIMITED;
+        job->idx = idx;
+        job->mad = mad;
+        job->hold = p->rt.hold;
+        job->w = f->w;
+        job->h = f->h;
+        job->bps = bps;
+        job->scale = rt_luma_scale(8 * bps, limited);
+        rt_cam_queue(vf);
+    } else {
+        MP_DBG(vf, "retime: frame %" PRId64 " pts=%f mad=%.17g\n", idx,
+               f->pts, mad);
+    }
     return true;
 }
 
@@ -1530,11 +1799,12 @@ static void rt_process(struct mp_filter *vf)
         clear_ring(vf);
 
     // Records for the window: the current frame and up to rt_ahead()
-    // futures (fewer only at the end of the stream, or before a format
-    // change).
+    // futures, plus camera mode's frame in flight (fewer only at the end of
+    // the stream, or before a format change).
     const int win = rt_ahead(rp);
+    const int qwin = rt_queue_ahead(rp);
     int ahead = -1;
-    for (int rel = 0; rel <= win; rel++) {
+    for (int rel = 0; rel <= qwin; rel++) {
         struct mp_image *f = mp_refqueue_get(p->queue, rel);
         if (!f)
             break;
@@ -1558,7 +1828,9 @@ static void rt_process(struct mp_filter *vf)
         return;
 
     const int64_t pos = p->rt_base;
-    const int64_t n = ahead < win ? pos + ahead + 1 : RT_N_UNKNOWN;
+    const int64_t n = ahead < qwin ? pos + ahead + 1 : RT_N_UNKNOWN;
+    if (rp->camera)  // the transitions rt_plan() reads
+        rt_cam_collect(vf, pos + MPMIN(win, ahead));
     const struct rt_plan plan = rt_plan(rp, pos, n, rt_get, vf);
     struct rt_frame *cur = rt_rec(p, pos);
     struct rt_frame *nxt = ahead >= 1 ? rt_rec(p, pos + 1) : NULL;
@@ -2158,6 +2430,7 @@ static void uninit(struct mp_filter *vf)
     struct priv *p = vf->priv;
 
     flush_frames(vf);
+    rt_cam_destroy(vf);
     talloc_free(p->queue);
     if (p->aji)
         p->api.destroy(&p->aji);
@@ -2339,6 +2612,8 @@ static const m_option_t vf_opts_fields[] = {
     {"rife-retime", OPT_BOOL(rife_retime)},
     {"retime-hold", OPT_DOUBLE(retime_hold), M_RANGE(0, 255)},
     {"retime-maxhold", OPT_INT(retime_maxhold), M_RANGE(1, RT_MAXHOLD_MAX)},
+    {"retime-camera", OPT_BOOL(retime_camera)},
+    {"retime-maxcam", OPT_INT(retime_maxcam), M_RANGE(1, RT_MAXCAM_MAX)},
     {0}
 };
 
@@ -2355,6 +2630,7 @@ const struct mp_user_filter_entry vf_animejanai = {
             .queue_depth = 3,
             .retime_hold = RT_HOLD_DEFAULT,
             .retime_maxhold = RT_MAXHOLD_DEFAULT,
+            .retime_maxcam = RT_MAXCAM_DEFAULT,
         },
         .options = vf_opts_fields,
     },

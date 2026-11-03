@@ -1393,6 +1393,8 @@ cuda_hwaccel = get_option('cuda-hwaccel').require(
 features += {'cuda-hwaccel': cuda_hwaccel.allowed()}
 if features['cuda-hwaccel']
     sources += files('video/filter/vf_animejanai.c',
+                     'video/filter/vf_animejanai_camera.c',
+                     'video/filter/vf_animejanai_camera_fft.c',
                      'video/out/hwdec/hwdec_cuda.c')
 endif
 
