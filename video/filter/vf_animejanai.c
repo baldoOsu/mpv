@@ -163,8 +163,9 @@ struct opts {
 
 #define MAX_DEPTH 4
 
-// Re-timing ring: frames p - (maxhold - 1) .. p + maxhold by stream index.
-#define RT_RING (2 * RT_MAXHOLD_MAX + 2)
+// Re-timing ring, by stream index: the records of frames p - rt_behind() ..
+// p + rt_ahead() (vf_animejanai_retime.h), plus one spare.
+#define RT_RING (RT_BEHIND_MAX + 1 + RT_AHEAD_MAX + 1)
 
 struct aji_api {
     void *handle;
@@ -291,10 +292,12 @@ struct priv {
                                      // when has_pre_resize
 
     // RIFE re-timing (rife-retime=yes; CUDA, integer factor, RIFE-first or
-    // RIFE-only chains). The refqueue holds the current frame plus maxhold
-    // future frames; every frame entering that window gets a record with a
-    // filter-owned copy (the RIFE endpoint / upscale input, so no decoder
-    // surface stays pinned once it leaves the window) and its hold metric.
+    // RIFE-only chains). The refqueue holds the current frame plus
+    // rt_ahead() future frames; every frame entering that window gets a
+    // record with a filter-owned copy (the RIFE endpoint / upscale input, so
+    // no decoder surface stays pinned once it leaves the window) and the
+    // metrics of the transition into it. Records stay for rt_behind() frames
+    // behind the current one (their copies only for rt_end_behind()).
     // Stream indices restart at 0 on every reset (seek), reinit and
     // reconfigure.
     bool rt_on;
@@ -306,7 +309,7 @@ struct priv {
         struct mp_image *ident; // refqueue frame (identity check only)
         struct mp_image *work;  // owned: RIFE endpoint, upscale input
         double pts;
-        double mad;             // transition idx - 1 -> idx (idx >= 1)
+        struct rt_trans tr;     // transition idx - 1 -> idx (idx >= 1)
     } rt_ring[RT_RING];
     uint64_t *rt_sums;          // 192x108 sums of frame rt_last
     uint64_t *rt_sums_new;
@@ -529,8 +532,9 @@ static void update_depth(struct mp_filter *vf)
     int depth = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
     p->depth = (p->aji_active && !p->rife_on) ? depth : 1;
     rt_configure(vf);
-    // Re-timing plans each frame with maxhold frames of lookahead.
-    mp_refqueue_set_refs(p->queue, 0, p->rt_on ? p->rt.maxhold : p->depth - 1);
+    // Re-timing plans each frame with rt_ahead() frames of lookahead.
+    mp_refqueue_set_refs(p->queue, 0, p->rt_on ? rt_ahead(&p->rt)
+                                               : p->depth - 1);
 }
 
 // (Re)configure the shim for the current stream params and slot. Updates
@@ -1339,16 +1343,16 @@ static struct rt_frame *rt_rec(struct priv *p, int64_t idx)
     return r->idx == idx ? r : NULL;
 }
 
-static double rt_mad(void *ctx, int64_t i)
+static struct rt_trans rt_get(void *ctx, int64_t i)
 {
     struct mp_filter *vf = ctx;
     struct rt_frame *r = rt_rec(vf->priv, i);
     if (!r) {
         // Planner window contract broken (a bug): never morph on it.
         MP_ERR(vf, "retime: no metric for frame %" PRId64 "\n", i);
-        return 0.0;
+        return (struct rt_trans){.mad = 0.0};
     }
-    return r->mad;
+    return r->tr;
 }
 
 // Filter-owned copy of a CUDA frame: RIFE-first interpolates and upscales
@@ -1465,7 +1469,8 @@ static bool rt_add(struct mp_filter *vf, struct mp_image *f, int64_t idx)
     }
     MPSWAP(uint64_t *, p->rt_sums, p->rt_sums_new);
     *r = (struct rt_frame){
-        .idx = idx, .ident = f, .work = work, .pts = f->pts, .mad = mad,
+        .idx = idx, .ident = f, .work = work, .pts = f->pts,
+        .tr = {.mad = mad},
     };
     p->rt_last = idx;
     MP_DBG(vf, "retime: frame %" PRId64 " pts=%f mad=%.17g\n", idx, f->pts,
@@ -1524,10 +1529,12 @@ static void rt_process(struct mp_filter *vf)
     if (p->ring_n)
         clear_ring(vf);
 
-    // Records for the window: the current frame and up to maxhold futures
-    // (fewer only at the end of the stream, or before a format change).
+    // Records for the window: the current frame and up to rt_ahead()
+    // futures (fewer only at the end of the stream, or before a format
+    // change).
+    const int win = rt_ahead(rp);
     int ahead = -1;
-    for (int rel = 0; rel <= rp->maxhold; rel++) {
+    for (int rel = 0; rel <= win; rel++) {
         struct mp_image *f = mp_refqueue_get(p->queue, rel);
         if (!f)
             break;
@@ -1551,8 +1558,8 @@ static void rt_process(struct mp_filter *vf)
         return;
 
     const int64_t pos = p->rt_base;
-    const int64_t n = ahead < rp->maxhold ? pos + ahead + 1 : RT_N_UNKNOWN;
-    const struct rt_plan plan = rt_plan(rp, pos, n, rt_mad, vf);
+    const int64_t n = ahead < win ? pos + ahead + 1 : RT_N_UNKNOWN;
+    const struct rt_plan plan = rt_plan(rp, pos, n, rt_get, vf);
     struct rt_frame *cur = rt_rec(p, pos);
     struct rt_frame *nxt = ahead >= 1 ? rt_rec(p, pos + 1) : NULL;
     const double in_fps = mp_refqueue_get(p->queue, 0)->nominal_fps;
@@ -1581,7 +1588,8 @@ static void rt_process(struct mp_filter *vf)
         if (st.interp) {
             struct rt_frame *ra = rt_rec(p, st.a), *rb = rt_rec(p, st.b);
             bool sc = false;
-            img = ra && rb ? rt_render_interp(vf, ra, rb, st.t, &sc) : NULL;
+            img = ra && rb && ra->work && rb->work
+                ? rt_render_interp(vf, ra, rb, st.t, &sc) : NULL;
             if (sc) {
                 MP_DBG(vf, "retime: scene a=%" PRId64 " b=%" PRId64 "\n",
                        plan.a, plan.b);
@@ -1628,13 +1636,16 @@ static void rt_process(struct mp_filter *vf)
     for (int i = 1; i < cnt; i++)
         p->outq[p->outq_n++] = list[i];
     p->outq_pos = 0;
-    // The refqueue moves on to pos + 1; drop records no later plan reads.
+    // The refqueue moves on to pos + 1; drop records no later plan reads,
+    // and the copies of frames no later plan names.
     p->rt_base++;
     const int64_t keep = p->rt_base - rt_behind(rp);
+    const int64_t keep_work = p->rt_base - rt_end_behind(rp);
     for (int i = 0; i < RT_RING; i++) {
         struct rt_frame *r = &p->rt_ring[i];
-        if (r->idx >= 0 && r->idx < keep) {
+        if (r->idx >= 0 && r->idx < keep_work)
             mp_image_unrefp(&r->work);
+        if (r->idx >= 0 && r->idx < keep) {
             r->idx = -1;
             r->ident = NULL;
         }
