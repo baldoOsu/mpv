@@ -55,6 +55,7 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <fenv.h>
 #include <inttypes.h>
 #include <stdio.h>
 
@@ -306,7 +307,8 @@ struct priv {
 
     // RIFE re-timing (rife-retime=yes; CUDA, integer factor, RIFE-first or
     // RIFE-only chains). The refqueue holds the current frame plus
-    // rt_ahead() future frames; every frame entering that window gets a
+    // rt_queue_ahead() future frames (rt_ahead(), plus one in camera mode
+    // for the metric in flight); every frame entering that window gets a
     // record with a filter-owned copy (the RIFE endpoint / upscale input, so
     // no decoder surface stays pinned once it leaves the window) and the
     // metrics of the transition into it. Records stay for rt_behind() frames
@@ -607,7 +609,8 @@ static void update_depth(struct mp_filter *vf)
     int depth = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
     p->depth = (p->aji_active && !p->rife_on) ? depth : 1;
     rt_configure(vf);
-    // Re-timing plans each frame with rt_ahead() frames of lookahead.
+    // Re-timing plans each frame with rt_ahead() frames of lookahead (one
+    // more queued in camera mode, see rt_queue_ahead()).
     mp_refqueue_set_refs(p->queue, 0, p->rt_on ? rt_queue_ahead(&p->rt)
                                                : p->depth - 1);
 }
@@ -1524,6 +1527,9 @@ static MP_THREAD_VOID rt_cam_thread(void *arg)
 {
     struct rt_cam *c = arg;
     mp_thread_set_name("aji-retime-cam");
+    // The metric is bit-exact under the default floating-point environment
+    // (round to nearest, no flush-to-zero); don't inherit another one.
+    fesetenv(FE_DFL_ENV);
     mp_mutex_lock(&c->lock);
     while (!c->quit) {
         if (c->head == c->tail) {
@@ -1603,8 +1609,11 @@ static void rt_cam_destroy(struct mp_filter *vf)
     p->rt_cam = NULL;
 }
 
-// Move finished results into their records (c->lock held).
-static void rt_cam_store_done(struct mp_filter *vf, struct rt_cam *c)
+// Move finished results into their records (c->lock held). The records
+// belong to the filter thread; the frames stored are listed in *logged
+// (*n_logged of them) for rt_cam_log() once the lock is released.
+static void rt_cam_store_done(struct mp_filter *vf, struct rt_cam *c,
+                              int64_t *logged, int *n_logged)
 {
     struct priv *p = vf->priv;
     for (; c->collected < c->head; c->collected++) {
@@ -1617,6 +1626,20 @@ static void rt_cam_store_done(struct mp_filter *vf, struct rt_cam *c)
         r->tr.dx = j->out.dx;
         r->tr.camera_only = j->out.camera_only;
         r->cam_pending = false;
+        if (*n_logged < RT_CAM_JOBS)
+            logged[(*n_logged)++] = r->idx;
+    }
+}
+
+// Debug lines for frames whose camera fields just arrived (lock released,
+// so slow terminal output never stalls the helper).
+static void rt_cam_log(struct mp_filter *vf, const int64_t *logged, int n)
+{
+    struct priv *p = vf->priv;
+    for (int i = 0; i < n; i++) {
+        const struct rt_frame *r = rt_rec(p, logged[i]);
+        if (!r)
+            continue;
         if (r->tr.has_shift) {
             MP_DBG(vf, "retime: frame %" PRId64 " pts=%f mad=%.17g shift=%d,%d "
                    "cam=%d\n", r->idx, r->pts, r->tr.mad, r->tr.dy, r->tr.dx,
@@ -1634,14 +1657,18 @@ static void rt_cam_collect(struct mp_filter *vf, int64_t upto)
 {
     struct priv *p = vf->priv;
     struct rt_cam *c = p->rt_cam;
+    // No job is queued meanwhile, so at most RT_CAM_JOBS results arrive.
+    int64_t logged[RT_CAM_JOBS];
+    int n_logged = 0;
     mp_mutex_lock(&c->lock);
     for (;;) {
-        rt_cam_store_done(vf, c);
+        rt_cam_store_done(vf, c, logged, &n_logged);
         if (c->head == c->tail || c->job[c->head % RT_CAM_JOBS].idx > upto)
             break;
         mp_cond_wait(&c->wakeup, &c->lock);
     }
     mp_mutex_unlock(&c->lock);
+    rt_cam_log(vf, logged, n_logged);
 }
 
 // Wait for the helper to finish everything queued and drop the results
@@ -1665,16 +1692,19 @@ static struct rt_cam_job *rt_cam_slot(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
     struct rt_cam *c = p->rt_cam;
+    int64_t logged[RT_CAM_JOBS];
+    int n_logged = 0;
     mp_mutex_lock(&c->lock);
     while (c->tail - c->collected >= RT_CAM_JOBS) {
         if (c->collected < c->head) {
-            rt_cam_store_done(vf, c);
+            rt_cam_store_done(vf, c, logged, &n_logged);
         } else {
             mp_cond_wait(&c->wakeup, &c->lock);
         }
     }
     struct rt_cam_job *j = &c->job[c->tail % RT_CAM_JOBS];
     mp_mutex_unlock(&c->lock);
+    rt_cam_log(vf, logged, n_logged);
     return j;
 }
 
@@ -1729,7 +1759,7 @@ static bool rt_add(struct mp_filter *vf, struct mp_image *f, int64_t idx)
     };
     p->rt_last = idx;
     if (job) {
-        // camera fields follow from the helper (logged by rt_cam_collect)
+        // camera fields follow from the helper (rt_cam_store_done logs them)
         const int bps = (p->layout.fmt.bpp[0] + 7) / 8;
         const bool limited = map_range(&p->params) == AJI_RANGE_LIMITED;
         job->idx = idx;
